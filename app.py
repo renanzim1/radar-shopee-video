@@ -13,14 +13,6 @@ from pathlib import Path
 DB = Path(__file__).with_name("radar.db")
 PORT = int(os.environ.get("PORT", "8787"))
 
-# Guarda temporariamente o último diagnóstico em memória.
-LAST_DEBUG = {
-    "tag": "",
-    "url": "",
-    "video": None,
-    "error": ""
-}
-
 
 # =========================================================
 # BANCO
@@ -37,356 +29,258 @@ def db():
             username TEXT,
             caption TEXT,
             hashtags TEXT,
-            views INTEGER,
-            likes INTEGER,
-            comments INTEGER,
-            product TEXT,
-            video_url TEXT,
-            shopee_url TEXT,
-            source TEXT
+            views INTEGER DEFAULT 0,
+            likes INTEGER DEFAULT 0,
+            comments INTEGER DEFAULT 0,
+            product TEXT DEFAULT '',
+            video_url TEXT DEFAULT '',
+            shopee_url TEXT DEFAULT '',
+            source TEXT DEFAULT 'hashtag'
         )
     """)
 
+    existing = {
+        row["name"]
+        for row in c.execute("PRAGMA table_info(videos)").fetchall()
+    }
+
+    extras = {
+        "cover": "TEXT DEFAULT ''",
+        "product_price": "INTEGER DEFAULT 0",
+        "old_price": "INTEGER DEFAULT 0",
+        "discount": "INTEGER DEFAULT 0",
+        "sold": "INTEGER DEFAULT 0",
+        "item_id": "TEXT DEFAULT ''",
+        "shop_id": "TEXT DEFAULT ''",
+        "product_url": "TEXT DEFAULT ''"
+    }
+
+    for name, sql_type in extras.items():
+        if name not in existing:
+            c.execute(
+                f"ALTER TABLE videos ADD COLUMN {name} {sql_type}"
+            )
+
+    c.commit()
     return c
 
 
 # =========================================================
-# FUNÇÕES AUXILIARES
+# AUXILIARES
 # =========================================================
 
-def to_int(value):
+def number(value):
     try:
-        if value is None:
-            return 0
-
-        if isinstance(value, bool):
-            return int(value)
-
-        if isinstance(value, (int, float)):
-            return int(value)
-
-        value = str(value).strip()
-
-        if not value:
-            return 0
-
-        return int(float(value))
-
+        return f"{int(value):,}".replace(",", ".")
     except:
-        return 0
+        return "0"
 
 
-def first_value(obj, names):
-    """
-    Procura recursivamente um campo dentro de dict/list.
-    """
+def money(value):
+    try:
+        # Valores da Shopee neste payload usam 100000 unidades
+        # para representar R$ 1,00.
+        value = int(value or 0) / 100000
 
-    if isinstance(obj, dict):
-
-        for name in names:
-            if name in obj:
-                value = obj.get(name)
-
-                if value not in (None, "", [], {}):
-                    return value
-
-        for value in obj.values():
-            result = first_value(value, names)
-
-            if result not in (None, "", [], {}):
-                return result
-
-    elif isinstance(obj, list):
-
-        for value in obj:
-            result = first_value(value, names)
-
-            if result not in (None, "", [], {}):
-                return result
-
-    return None
+        return (
+            f"R$ {value:,.2f}"
+            .replace(",", "X")
+            .replace(".", ",")
+            .replace("X", ".")
+        )
+    except:
+        return ""
 
 
-def max_metric(obj, names):
-    """
-    Procura todas as ocorrências possíveis de uma métrica
-    dentro do bloco do vídeo e fica com o maior valor.
-    """
+def esc(value):
+    return html.escape(str(value or ""))
 
-    values = []
 
-    normalized_names = {
-        re.sub(r"[^a-z0-9]", "", x.lower())
-        for x in names
+def esc_attr(value):
+    return html.escape(str(value or ""), quote=True)
+
+
+# =========================================================
+# EXTRAÇÃO
+# =========================================================
+
+def extract_video(item):
+
+    meta = item.get("meta") or {}
+    content = item.get("content") or {}
+
+    pid = meta.get("postId")
+
+    if not pid:
+        return None
+
+    user_id = meta.get("userId") or ""
+    username = meta.get("userName") or ""
+
+    caption = content.get("caption") or ""
+
+    # ---------------- MÉTRICAS ----------------
+
+    count = meta.get("countInfo") or {}
+
+    views = int(count.get("views") or 0)
+    likes = int(count.get("likes") or 0)
+    comments = int(count.get("comments") or 0)
+
+    # ---------------- HASHTAGS ----------------
+
+    hashtags = re.findall(
+        r"#([\wÀ-ÿ]+)",
+        caption
+    )
+
+    # ---------------- VÍDEO ----------------
+
+    video = content.get("video") or {}
+
+    cover = (
+        video.get("cover")
+        or video.get("mmsCover")
+        or ""
+    )
+
+    video_url = (
+        video.get("url")
+        or video.get("watermarkVideoUrl")
+        or ""
+    )
+
+    # ---------------- PRODUTO ----------------
+
+    products = content.get("products") or {}
+
+    product = (
+        products.get("anchorProduct")
+        or {}
+    )
+
+    product_name = product.get("name") or ""
+
+    item_id = product.get("itemId") or ""
+    shop_id = product.get("shopId") or ""
+
+    product_price = int(
+        product.get("price") or 0
+    )
+
+    old_price = int(
+        product.get("priceBeforeDiscount") or 0
+    )
+
+    discount = 0
+    sold = 0
+
+    enhanced = products.get(
+        "enhancedItemList"
+    ) or []
+
+    if enhanced:
+
+        ep = enhanced[0]
+
+        if not product_name:
+            product_name = ep.get("name") or ""
+
+        if not product_price:
+            product_price = int(
+                ep.get("price") or 0
+            )
+
+        if not old_price:
+            old_price = int(
+                ep.get("priceBeforeDiscount") or 0
+            )
+
+        discount = int(
+            ep.get("discount") or 0
+        )
+
+        sold = int(
+            ep.get("historicalSold")
+            or ep.get("sold")
+            or 0
+        )
+
+    # ---------------- LINK DO PRODUTO ----------------
+    #
+    # itemId e shopId são fornecidos pelo próprio payload.
+    # Link padrão da página do produto.
+
+    product_url = ""
+
+    if item_id and shop_id:
+        product_url = (
+            "https://shopee.com.br/product/"
+            f"{shop_id}/{item_id}"
+        )
+
+    return {
+        "post_id": str(pid),
+        "user_id": str(user_id),
+        "username": str(username),
+        "caption": str(caption),
+        "hashtags": ",".join(hashtags),
+
+        "views": views,
+        "likes": likes,
+        "comments": comments,
+
+        "product": str(product_name),
+
+        "video_url": str(video_url),
+        "cover": str(cover),
+
+        # Ainda não fabricamos link do post.
+        "shopee_url": "",
+
+        "source": "hashtag",
+
+        "product_price": product_price,
+        "old_price": old_price,
+        "discount": discount,
+        "sold": sold,
+
+        "item_id": str(item_id),
+        "shop_id": str(shop_id),
+        "product_url": product_url
     }
 
-    def scan(x):
 
-        if isinstance(x, dict):
-
-            for key, value in x.items():
-
-                normalized_key = re.sub(
-                    r"[^a-z0-9]",
-                    "",
-                    str(key).lower()
-                )
-
-                if normalized_key in normalized_names:
-                    values.append(to_int(value))
-
-                scan(value)
-
-        elif isinstance(x, list):
-
-            for value in x:
-                scan(value)
-
-    scan(obj)
-
-    return max(values) if values else 0
-
-
-def find_video_container(obj):
-    """
-    Procura um bloco que aparentemente representa
-    um vídeo/post completo.
-    """
+def find_items(obj, output):
 
     if isinstance(obj, dict):
 
         meta = obj.get("meta")
+        content = obj.get("content")
 
-        if isinstance(meta, dict):
+        # Esta é a estrutura que confirmamos no diagnóstico.
+        if (
+            isinstance(meta, dict)
+            and isinstance(content, dict)
+            and meta.get("postId")
+        ):
 
-            pid = (
-                meta.get("postId")
-                or meta.get("post_id")
-            )
+            record = extract_video(obj)
 
-            if pid:
-                return obj
+            if record:
+                output[record["post_id"]] = record
 
-        # Alguns formatos podem não possuir "meta"
-        pid = (
-            obj.get("postId")
-            or obj.get("post_id")
-        )
-
-        if pid and len(obj) > 2:
-            return obj
+            # Não precisamos interpretar novamente o mesmo
+            # item por dentro.
+            return
 
         for value in obj.values():
-
-            result = find_video_container(value)
-
-            if result:
-                return result
+            find_items(value, output)
 
     elif isinstance(obj, list):
 
         for value in obj:
-
-            result = find_video_container(value)
-
-            if result:
-                return result
-
-    return None
-
-
-def extract_video(container):
-
-    meta = container.get("meta")
-
-    if not isinstance(meta, dict):
-        meta = container
-
-    content = container.get("content")
-
-    if not isinstance(content, dict):
-        content = {}
-
-    pid = (
-        meta.get("postId")
-        or meta.get("post_id")
-        or first_value(container, ["postId", "post_id"])
-    )
-
-    uid = (
-        meta.get("userId")
-        or meta.get("user_id")
-        or first_value(container, ["userId", "user_id"])
-    )
-
-    username = (
-        meta.get("userName")
-        or meta.get("username")
-        or first_value(
-            container,
-            ["userName", "username"]
-        )
-        or ""
-    )
-
-    caption = (
-        content.get("caption")
-        or meta.get("caption")
-        or first_value(container, ["caption"])
-        or ""
-    )
-
-    views = max_metric(
-        container,
-        [
-            "views",
-            "viewCount",
-            "view_count",
-            "viewCnt",
-            "view_cnt",
-            "playCount",
-            "play_count"
-        ]
-    )
-
-    likes = max_metric(
-        container,
-        [
-            "likes",
-            "likeCount",
-            "like_count",
-            "likeCnt",
-            "like_cnt"
-        ]
-    )
-
-    comments = max_metric(
-        container,
-        [
-            "comments",
-            "commentCount",
-            "comment_count",
-            "commentCnt",
-            "comment_cnt"
-        ]
-    )
-
-    hashtags = re.findall(
-        r"#([\wÀ-ÿ]+)",
-        str(caption)
-    )
-
-    # -----------------------------------------------------
-    # CAPA
-    # -----------------------------------------------------
-
-    cover = first_value(
-        content,
-        [
-            "coverUrl",
-            "cover_url",
-            "cover",
-            "thumbnailUrl",
-            "thumbnail_url",
-            "thumbnail",
-            "imageUrl",
-            "image_url"
-        ]
-    )
-
-    if isinstance(cover, dict):
-        cover = first_value(
-            cover,
-            ["url", "imageUrl", "image_url"]
-        )
-
-    if isinstance(cover, list):
-        cover = cover[0] if cover else ""
-
-    # -----------------------------------------------------
-    # URL DO VÍDEO
-    # -----------------------------------------------------
-
-    video_url = ""
-
-    video = content.get("video")
-
-    if isinstance(video, dict):
-
-        video_url = (
-            video.get("url")
-            or video.get("videoUrl")
-            or video.get("video_url")
-            or first_value(
-                video,
-                ["videoUrl", "video_url", "url"]
-            )
-            or ""
-        )
-
-    # -----------------------------------------------------
-    # LINK SHOPEE
-    #
-    # Não fabricamos mais o share-video.
-    # Procuramos URL fornecida pelo próprio payload.
-    # -----------------------------------------------------
-
-    shopee_url = first_value(
-        container,
-        [
-            "shareUrl",
-            "share_url",
-            "deeplink",
-            "deepLink",
-            "webUrl",
-            "web_url",
-            "postUrl",
-            "post_url"
-        ]
-    )
-
-    if not isinstance(shopee_url, str):
-        shopee_url = ""
-
-    # -----------------------------------------------------
-    # PRODUTO
-    # -----------------------------------------------------
-
-    product = ""
-
-    product_block = first_value(
-        container,
-        [
-            "anchorProduct",
-            "anchor_product",
-            "product"
-        ]
-    )
-
-    if isinstance(product_block, dict):
-
-        product = (
-            product_block.get("itemName")
-            or product_block.get("item_name")
-            or product_block.get("name")
-            or product_block.get("title")
-            or ""
-        )
-
-    return {
-        "post_id": str(pid or ""),
-        "user_id": str(uid or ""),
-        "username": str(username or ""),
-        "caption": str(caption or ""),
-        "hashtags": ",".join(hashtags),
-        "views": views,
-        "likes": likes,
-        "comments": comments,
-        "product": str(product or ""),
-        "video_url": str(video_url or ""),
-        "shopee_url": str(shopee_url or ""),
-        "cover": str(cover or "")
-    }
+            find_items(value, output)
 
 
 # =========================================================
@@ -395,9 +289,10 @@ def extract_video(container):
 
 def collect(tag):
 
-    global LAST_DEBUG
-
     tag = tag.strip().lstrip("#")
+
+    if not tag:
+        return 0
 
     url = (
         "https://sv.shopee.com.br/web/hashtag/"
@@ -409,7 +304,9 @@ def collect(tag):
         headers={
             "User-Agent":
                 "Mozilla/5.0 (Linux; Android 15) "
-                "AppleWebKit/537.36 Chrome/140 Safari/537.36",
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/140 Mobile Safari/537.36",
 
             "Accept":
                 "text/html,application/xhtml+xml",
@@ -421,7 +318,7 @@ def collect(tag):
 
     raw = urllib.request.urlopen(
         req,
-        timeout=25
+        timeout=30
     ).read().decode(
         "utf-8",
         "ignore"
@@ -436,152 +333,32 @@ def collect(tag):
     )
 
     if not match:
-
-        LAST_DEBUG = {
-            "tag": tag,
-            "url": url,
-            "video": None,
-            "error": "__NEXT_DATA__ não encontrado"
-        }
-
-        return 0, "__NEXT_DATA__ não encontrado"
+        raise Exception(
+            "A Shopee não retornou o bloco __NEXT_DATA__."
+        )
 
     raw_json = match.group(1)
 
     try:
         data = json.loads(raw_json)
-
     except:
         data = json.loads(
             html.unescape(raw_json)
         )
 
-    # -----------------------------------------------------
-    # ENCONTRA PRIMEIRO VÍDEO COMPLETO
-    # -----------------------------------------------------
-
-    container = find_video_container(data)
-
-    if not container:
-
-        LAST_DEBUG = {
-            "tag": tag,
-            "url": url,
-            "video": None,
-            "error": "Nenhum bloco de vídeo encontrado"
-        }
-
-        return 0, "Nenhum vídeo encontrado"
-
-    # Guarda o bloco bruto para diagnóstico.
-    LAST_DEBUG = {
-        "tag": tag,
-        "url": url,
-        "video": container,
-        "error": ""
-    }
-
-    # -----------------------------------------------------
-    # PROCURA TODOS OS CONTAINERS
-    # -----------------------------------------------------
-
-    containers = []
-
-    def scan(x):
-
-        if isinstance(x, dict):
-
-            meta = x.get("meta")
-
-            if isinstance(meta, dict):
-
-                pid = (
-                    meta.get("postId")
-                    or meta.get("post_id")
-                )
-
-                if pid:
-                    containers.append(x)
-
-            for value in x.values():
-                scan(value)
-
-        elif isinstance(x, list):
-
-            for value in x:
-                scan(value)
-
-    scan(data)
-
-    # -----------------------------------------------------
-    # REMOVE DUPLICADOS
-    # -----------------------------------------------------
-
     videos = {}
 
-    for container in containers:
+    find_items(
+        data,
+        videos
+    )
 
-        record = extract_video(container)
-
-        pid = record["post_id"]
-
-        if not pid:
-            continue
-
-        if pid not in videos:
-            videos[pid] = record
-
-        else:
-            old = videos[pid]
-
-            old["views"] = max(
-                old["views"],
-                record["views"]
-            )
-
-            old["likes"] = max(
-                old["likes"],
-                record["likes"]
-            )
-
-            old["comments"] = max(
-                old["comments"],
-                record["comments"]
-            )
-
-            for field in [
-                "username",
-                "caption",
-                "hashtags",
-                "product",
-                "video_url",
-                "shopee_url",
-                "cover"
-            ]:
-
-                if not old.get(field) and record.get(field):
-                    old[field] = record[field]
-
-    # -----------------------------------------------------
-    # BANCO
-    #
-    # O banco atual não possui coluna cover.
-    # Criamos se necessário.
-    # -----------------------------------------------------
+    if not videos:
+        raise Exception(
+            "Nenhum vídeo foi encontrado nessa hashtag."
+        )
 
     c = db()
-
-    columns = [
-        x["name"]
-        for x in c.execute(
-            "PRAGMA table_info(videos)"
-        ).fetchall()
-    ]
-
-    if "cover" not in columns:
-        c.execute(
-            "ALTER TABLE videos ADD COLUMN cover TEXT DEFAULT ''"
-        )
 
     for r in videos.values():
 
@@ -599,58 +376,33 @@ def collect(tag):
                 video_url,
                 shopee_url,
                 source,
-                cover
+                cover,
+                product_price,
+                old_price,
+                discount,
+                sold,
+                item_id,
+                shop_id,
+                product_url
             )
 
             VALUES(
-                ?,?,?,?,?,?,?,?,?,?,?,?,?
+                ?,?,?,?,?,?,?,?,?,?,
+                ?,?,?,?,?,?,?,?,?,?
             )
 
             ON CONFLICT(post_id) DO UPDATE SET
 
-                user_id =
-                    CASE
-                        WHEN excluded.user_id != ''
-                        THEN excluded.user_id
-                        ELSE videos.user_id
-                    END,
+                user_id = excluded.user_id,
+                username = excluded.username,
+                caption = excluded.caption,
+                hashtags = excluded.hashtags,
 
-                username =
-                    CASE
-                        WHEN excluded.username != ''
-                        THEN excluded.username
-                        ELSE videos.username
-                    END,
+                views = excluded.views,
+                likes = excluded.likes,
+                comments = excluded.comments,
 
-                caption =
-                    CASE
-                        WHEN excluded.caption != ''
-                        THEN excluded.caption
-                        ELSE videos.caption
-                    END,
-
-                hashtags =
-                    CASE
-                        WHEN excluded.hashtags != ''
-                        THEN excluded.hashtags
-                        ELSE videos.hashtags
-                    END,
-
-                views =
-                    MAX(videos.views, excluded.views),
-
-                likes =
-                    MAX(videos.likes, excluded.likes),
-
-                comments =
-                    MAX(videos.comments, excluded.comments),
-
-                product =
-                    CASE
-                        WHEN excluded.product != ''
-                        THEN excluded.product
-                        ELSE videos.product
-                    END,
+                product = excluded.product,
 
                 video_url =
                     CASE
@@ -659,18 +411,26 @@ def collect(tag):
                         ELSE videos.video_url
                     END,
 
-                shopee_url =
-                    CASE
-                        WHEN excluded.shopee_url != ''
-                        THEN excluded.shopee_url
-                        ELSE videos.shopee_url
-                    END,
-
                 cover =
                     CASE
                         WHEN excluded.cover != ''
                         THEN excluded.cover
                         ELSE videos.cover
+                    END,
+
+                product_price = excluded.product_price,
+                old_price = excluded.old_price,
+                discount = excluded.discount,
+                sold = excluded.sold,
+
+                item_id = excluded.item_id,
+                shop_id = excluded.shop_id,
+
+                product_url =
+                    CASE
+                        WHEN excluded.product_url != ''
+                        THEN excluded.product_url
+                        ELSE videos.product_url
                     END
 
         """, (
@@ -679,28 +439,43 @@ def collect(tag):
             r["username"],
             r["caption"],
             r["hashtags"],
+
             r["views"],
             r["likes"],
             r["comments"],
+
             r["product"],
             r["video_url"],
             r["shopee_url"],
-            "hashtag",
-            r["cover"]
+            r["source"],
+            r["cover"],
+
+            r["product_price"],
+            r["old_price"],
+            r["discount"],
+            r["sold"],
+
+            r["item_id"],
+            r["shop_id"],
+            r["product_url"]
         ))
 
     c.commit()
     c.close()
 
-    return len(videos), url
+    return len(videos)
 
 
 # =========================================================
-# INTERFACE
+# HTML
 # =========================================================
 
 PAGE = """
 <!doctype html>
+
+<html lang="pt-BR">
+
+<head>
 
 <meta charset="utf-8">
 
@@ -714,193 +489,305 @@ PAGE = """
 <style>
 
 *{
-    box-sizing:border-box
+    box-sizing:border-box;
 }
 
 body{
-    font-family:system-ui,-apple-system,sans-serif;
-    background:#f5f6f8;
     margin:0;
-    color:#171717
+    background:#f5f6f8;
+    color:#171717;
+    font-family:
+        system-ui,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
 }
 
 .wrap{
-    max-width:1100px;
+    width:min(1100px,100%);
     margin:auto;
-    padding:18px
+    padding:18px;
 }
 
 .hero{
     background:#ee4d2d;
-    color:white;
-    padding:24px;
-    border-radius:20px
+    color:#fff;
+    padding:26px;
+    border-radius:22px;
 }
 
 .hero h1{
-    margin:0 0 8px
+    margin:0 0 8px;
+    font-size:clamp(32px,7vw,54px);
+    line-height:1;
+}
+
+.hero p{
+    margin:0;
+    font-size:18px;
 }
 
 .collect{
     display:flex;
-    gap:8px;
-    margin-top:16px
+    gap:9px;
+    margin-top:20px;
 }
 
 input,
 select,
 button{
-    padding:13px;
     border:0;
-    border-radius:12px;
-    font-size:16px
+    border-radius:13px;
+    font:inherit;
+}
+
+input,
+select{
+    background:#fff;
+    padding:14px;
 }
 
 input{
+    min-width:0;
     flex:1;
-    min-width:0
 }
 
 button{
+    padding:14px 20px;
     background:#111;
-    color:white;
-    font-weight:700
+    color:#fff;
+    font-weight:800;
+    cursor:pointer;
 }
 
-.bar{
-    display:flex;
-    gap:10px;
-    margin:18px 0;
-    align-items:center;
-    flex-wrap:wrap
+.toolbar{
+    margin:20px 0;
+}
+
+.total{
+    font-size:21px;
+    font-weight:900;
+    margin-bottom:12px;
 }
 
 .search{
-    display:flex;
+    display:grid;
+    grid-template-columns:1fr auto auto;
     gap:8px;
-    flex:1;
-    min-width:280px
 }
 
 .grid{
     display:grid;
     grid-template-columns:
-        repeat(auto-fill,minmax(250px,1fr));
-    gap:14px
+        repeat(auto-fill,minmax(270px,1fr));
+    gap:16px;
 }
 
 .card{
-    background:white;
-    border-radius:17px;
+    background:#fff;
+    border-radius:20px;
     overflow:hidden;
-    box-shadow:0 2px 12px #00000010
+    box-shadow:
+        0 4px 18px rgba(0,0,0,.06);
+}
+
+.media{
+    position:relative;
+    background:#e9e9e9;
+    aspect-ratio:9/12;
+    overflow:hidden;
 }
 
 .cover{
     width:100%;
-    aspect-ratio:9/12;
+    height:100%;
     object-fit:cover;
-    background:#e9e9e9;
-    display:block
+    display:block;
 }
 
-.no-cover{
-    width:100%;
-    aspect-ratio:9/12;
-    background:#e9e9e9;
+.play{
+    position:absolute;
+    left:50%;
+    top:50%;
+    transform:translate(-50%,-50%);
+
+    width:64px;
+    height:64px;
+
+    border-radius:50%;
+
+    background:rgba(0,0,0,.72);
+    color:#fff;
+
     display:flex;
     align-items:center;
     justify-content:center;
-    color:#888;
-    font-weight:700
+
+    font-size:26px;
+
+    cursor:pointer;
+    border:0;
+}
+
+video{
+    width:100%;
+    height:100%;
+    object-fit:cover;
+    display:block;
+    background:#000;
 }
 
 .body{
-    padding:15px
+    padding:16px;
 }
 
-.user{
-    font-weight:800
+.username{
+    font-size:18px;
+    font-weight:900;
 }
 
 .caption{
-    min-height:42px;
-    max-height:65px;
+    color:#444;
+    line-height:1.35;
+
+    display:-webkit-box;
+    -webkit-line-clamp:3;
+    -webkit-box-orient:vertical;
+
     overflow:hidden;
-    color:#444
 }
 
 .stats{
     display:flex;
-    gap:13px;
-    font-weight:800;
-    margin:12px 0;
-    flex-wrap:wrap
+    gap:15px;
+    margin:13px 0;
+    font-weight:900;
 }
 
 .product{
+    background:#fff1ed;
+    border-radius:12px;
+    padding:12px;
+    margin-top:10px;
+}
+
+.product-name{
+    font-weight:700;
+
+    display:-webkit-box;
+    -webkit-line-clamp:2;
+    -webkit-box-orient:vertical;
+
+    overflow:hidden;
+}
+
+.price-line{
+    display:flex;
+    gap:8px;
+    align-items:center;
+    flex-wrap:wrap;
+    margin-top:8px;
+}
+
+.price{
+    color:#ee4d2d;
+    font-size:19px;
+    font-weight:900;
+}
+
+.old{
+    color:#888;
+    text-decoration:line-through;
     font-size:13px;
-    background:#fff2ef;
-    padding:9px;
-    border-radius:9px;
-    margin-bottom:10px
+}
+
+.discount{
+    background:#ee4d2d;
+    color:#fff;
+    font-size:12px;
+    padding:3px 7px;
+    border-radius:6px;
+    font-weight:800;
+}
+
+.sold{
+    margin-top:6px;
+    color:#666;
+    font-size:13px;
 }
 
 .tags{
+    color:#ee4d2d;
     font-size:12px;
-    color:#ee4d2d
+    margin-top:11px;
+    overflow:hidden;
 }
 
-.open{
+.product-link{
     display:block;
+    margin-top:13px;
+    padding:12px;
+
+    background:#ee4d2d;
+    color:#fff;
+
     text-align:center;
     text-decoration:none;
-    background:#ee4d2d;
-    color:white;
-    padding:11px;
-    border-radius:10px;
-    margin-top:13px;
-    font-weight:800
+
+    border-radius:11px;
+    font-weight:900;
 }
 
-.disabled{
-    display:block;
-    text-align:center;
-    background:#ddd;
-    color:#777;
-    padding:11px;
-    border-radius:10px;
-    margin-top:13px;
-    font-weight:700
+.empty{
+    background:#fff;
+    border-radius:16px;
+    padding:25px;
 }
 
-.debug{
-    display:inline-block;
-    margin-top:13px;
-    color:white;
-    font-weight:700
-}
+@media(max-width:650px){
 
-pre{
-    white-space:pre-wrap;
-    word-break:break-word;
-    background:#111;
-    color:#eaeaea;
-    padding:16px;
-    border-radius:15px
+    .wrap{
+        padding:14px;
+    }
+
+    .hero{
+        padding:22px;
+    }
+
+    .collect{
+        display:grid;
+        grid-template-columns:1fr auto;
+    }
+
+    .search{
+        grid-template-columns:1fr auto;
+    }
+
+    .search input{
+        grid-column:1/-1;
+    }
+
 }
 
 </style>
 
+</head>
+
+<body>
+
 <div class="wrap">
 
-    <div class="hero">
+    <section class="hero">
 
-        <h1>Radar Shopee Vídeo 🇧🇷</h1>
+        <h1>
+            Radar Shopee Vídeo 🇧🇷
+        </h1>
 
-        <div>
-            Descubra vídeos públicos por nicho/hashtag.
-        </div>
+        <p>
+            Descubra e organize vídeos públicos
+            por nicho/hashtag.
+        </p>
 
         <form
             class="collect"
@@ -920,20 +807,13 @@ pre{
 
         </form>
 
-        <a
-            class="debug"
-            href="/debug"
-        >
-            🔧 Ver diagnóstico
-        </a>
+    </section>
 
-    </div>
+    <section class="toolbar">
 
-    <div class="bar">
-
-        <b>
+        <div class="total">
             {{COUNT}} vídeos no banco
-        </b>
+        </div>
 
         <form
             class="search"
@@ -944,21 +824,23 @@ pre{
             <input
                 name="q"
                 value="{{Q}}"
-                placeholder="Buscar legenda, hashtag ou criador"
+                placeholder="Buscar criador, produto ou legenda"
             >
 
             <select name="sort">
-                <option value="views">
+
+                <option value="views" {{SV}}>
                     Mais vistos
                 </option>
 
-                <option value="likes">
+                <option value="likes" {{SL}}>
                     Mais curtidos
                 </option>
 
-                <option value="comments">
+                <option value="comments" {{SC}}>
                     Mais comentados
                 </option>
+
             </select>
 
             <button>
@@ -967,21 +849,218 @@ pre{
 
         </form>
 
-    </div>
+    </section>
 
-    <div class="grid">
+    <section class="grid">
         {{CARDS}}
-    </div>
+    </section>
 
 </div>
+
+<script>
+
+function playVideo(button){
+
+    const box = button.parentElement;
+
+    const url = button.dataset.video;
+
+    if(!url){
+        return;
+    }
+
+    box.innerHTML = "";
+
+    const video =
+        document.createElement("video");
+
+    video.src = url;
+    video.controls = true;
+    video.autoplay = true;
+    video.playsInline = true;
+
+    box.appendChild(video);
+}
+
+</script>
+
+</body>
+</html>
 """
 
 
-def number(n):
-    try:
-        return f"{int(n):,}".replace(",", ".")
-    except:
-        return "0"
+# =========================================================
+# CARD
+# =========================================================
+
+def make_card(r):
+
+    cover = r["cover"] or ""
+    video_url = r["video_url"] or ""
+
+    if cover:
+
+        media = (
+            '<div class="media">'
+            '<img class="cover" loading="lazy" src="'
+            + esc_attr(cover)
+            + '">'
+        )
+
+        if video_url:
+
+            media += (
+                '<button class="play" '
+                'data-video="'
+                + esc_attr(video_url)
+                + '" '
+                'onclick="playVideo(this)">'
+                '▶'
+                '</button>'
+            )
+
+        media += "</div>"
+
+    elif video_url:
+
+        media = (
+            '<div class="media">'
+            '<button class="play" '
+            'data-video="'
+            + esc_attr(video_url)
+            + '" '
+            'onclick="playVideo(this)">'
+            '▶'
+            '</button>'
+            '</div>'
+        )
+
+    else:
+
+        media = (
+            '<div class="media"></div>'
+        )
+
+    # ---------------- PRODUTO ----------------
+
+    product_html = ""
+
+    if r["product"]:
+
+        product_html = (
+            '<div class="product">'
+            '<div class="product-name">🛍️ '
+            + esc(r["product"])
+            + '</div>'
+        )
+
+        if r["product_price"]:
+
+            product_html += (
+                '<div class="price-line">'
+                '<span class="price">'
+                + money(r["product_price"])
+                + '</span>'
+            )
+
+            if (
+                r["old_price"]
+                and r["old_price"] > r["product_price"]
+            ):
+
+                product_html += (
+                    '<span class="old">'
+                    + money(r["old_price"])
+                    + '</span>'
+                )
+
+            if r["discount"]:
+
+                product_html += (
+                    '<span class="discount">'
+                    + str(r["discount"])
+                    + '% OFF</span>'
+                )
+
+            product_html += "</div>"
+
+        if r["sold"]:
+
+            product_html += (
+                '<div class="sold">'
+                + number(r["sold"])
+                + ' vendidos'
+                '</div>'
+            )
+
+        product_html += "</div>"
+
+    # ---------------- BOTÃO ----------------
+
+    product_button = ""
+
+    if r["product_url"]:
+
+        product_button = (
+            '<a class="product-link" '
+            'target="_blank" '
+            'rel="noopener" '
+            'href="'
+            + esc_attr(r["product_url"])
+            + '">'
+            '🛒 Abrir produto na Shopee'
+            '</a>'
+        )
+
+    hashtags = r["hashtags"] or ""
+
+    if hashtags:
+
+        hashtags = " #" + hashtags.replace(
+            ",",
+            " #"
+        )
+
+    return (
+        '<article class="card">'
+        + media
+        + '<div class="body">'
+
+        + '<div class="username">@'
+        + esc(r["username"] or "desconhecido")
+        + '</div>'
+
+        + '<p class="caption">'
+        + esc(r["caption"])
+        + '</p>'
+
+        + '<div class="stats">'
+
+        + '<span>👁 '
+        + number(r["views"])
+        + '</span>'
+
+        + '<span>❤️ '
+        + number(r["likes"])
+        + '</span>'
+
+        + '<span>💬 '
+        + number(r["comments"])
+        + '</span>'
+
+        + '</div>'
+
+        + product_html
+
+        + '<div class="tags">'
+        + esc(hashtags)
+        + '</div>'
+
+        + product_button
+
+        + '</div>'
+        + '</article>'
+    )
 
 
 # =========================================================
@@ -990,7 +1069,7 @@ def number(n):
 
 class H(BaseHTTPRequestHandler):
 
-    def send_html(self, content, code=200):
+    def send_html(self, text, code=200):
 
         self.send_response(code)
 
@@ -1002,25 +1081,41 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
 
         self.wfile.write(
-            content.encode("utf-8")
+            text.encode("utf-8")
         )
 
     def do_POST(self):
 
-        if self.path != "/collect":
-            self.send_html("Não encontrado", 404)
+        parsed = urllib.parse.urlparse(
+            self.path
+        )
+
+        if parsed.path != "/collect":
+
+            self.send_html(
+                "Não encontrado",
+                404
+            )
+
             return
 
-        size = int(
+        length = int(
             self.headers.get(
                 "Content-Length",
                 "0"
             )
         )
 
-        body = self.rfile.read(size).decode()
+        body = self.rfile.read(
+            length
+        ).decode(
+            "utf-8",
+            "ignore"
+        )
 
-        form = urllib.parse.parse_qs(body)
+        form = urllib.parse.parse_qs(
+            body
+        )
 
         tag = form.get(
             "tag",
@@ -1031,8 +1126,6 @@ class H(BaseHTTPRequestHandler):
 
             collect(tag)
 
-            # Não filtra automaticamente pela hashtag.
-            # Assim os cards aparecem imediatamente.
             self.send_response(303)
 
             self.send_header(
@@ -1044,15 +1137,16 @@ class H(BaseHTTPRequestHandler):
 
         except Exception as e:
 
-            global LAST_DEBUG
-
-            LAST_DEBUG["error"] = str(e)
-
             self.send_html(
+                "<meta name='viewport' "
+                "content='width=device-width,initial-scale=1'>"
+                "<div style='font-family:system-ui;padding:20px'>"
                 "<h2>Erro na coleta</h2>"
-                "<pre>"
-                + html.escape(str(e))
-                + "</pre>",
+                "<pre style='white-space:pre-wrap'>"
+                + esc(str(e))
+                + "</pre>"
+                "<p><a href='/'>Voltar</a></p>"
+                "</div>",
                 500
             )
 
@@ -1062,81 +1156,14 @@ class H(BaseHTTPRequestHandler):
             self.path
         )
 
-        # -------------------------------------------------
-        # DIAGNÓSTICO
-        # -------------------------------------------------
-
-        if parsed.path == "/debug":
-
-            if LAST_DEBUG["video"] is None:
-
-                self.send_html("""
-                    <meta name="viewport"
-                    content="width=device-width,initial-scale=1">
-
-                    <h2>Diagnóstico</h2>
-
-                    <p>
-                    Primeiro volte ao Radar e faça uma coleta.
-                    Depois abra esta página novamente.
-                    </p>
-                """)
-
-                return
-
-            raw = json.dumps(
-                LAST_DEBUG["video"],
-                ensure_ascii=False,
-                indent=2
-            )
+        if parsed.path != "/":
 
             self.send_html(
-                """
-                <meta
-                    name="viewport"
-                    content="width=device-width,initial-scale=1"
-                >
-
-                <style>
-                    body{
-                        font-family:system-ui;
-                        padding:15px
-                    }
-
-                    pre{
-                        white-space:pre-wrap;
-                        word-break:break-word;
-                        background:#111;
-                        color:#eee;
-                        padding:15px;
-                        border-radius:12px
-                    }
-                </style>
-
-                <h2>🔧 Diagnóstico Shopee</h2>
-
-                <p>
-                    Hashtag:
-                    <b>"""
-                + html.escape(LAST_DEBUG["tag"])
-                + """</b>
-                </p>
-
-                <p>
-                    Tire prints desta página e me envie.
-                </p>
-
-                <pre>"""
-                + html.escape(raw)
-                + """</pre>
-                """
+                "Não encontrado",
+                404
             )
 
             return
-
-        # -------------------------------------------------
-        # HOME
-        # -------------------------------------------------
 
         qs = urllib.parse.parse_qs(
             parsed.query
@@ -1145,7 +1172,7 @@ class H(BaseHTTPRequestHandler):
         q = qs.get(
             "q",
             [""]
-        )[0]
+        )[0].strip()
 
         sort = qs.get(
             "sort",
@@ -1157,25 +1184,10 @@ class H(BaseHTTPRequestHandler):
             "likes",
             "comments"
         ):
+
             sort = "views"
 
         c = db()
-
-        columns = [
-            x["name"]
-            for x in c.execute(
-                "PRAGMA table_info(videos)"
-            ).fetchall()
-        ]
-
-        if "cover" not in columns:
-
-            c.execute(
-                "ALTER TABLE videos "
-                "ADD COLUMN cover TEXT DEFAULT ''"
-            )
-
-            c.commit()
 
         count = c.execute(
             "SELECT COUNT(*) FROM videos"
@@ -1183,23 +1195,28 @@ class H(BaseHTTPRequestHandler):
 
         if q:
 
+            like = "%" + q + "%"
+
             rows = c.execute(
                 f"""
                 SELECT *
                 FROM videos
+
                 WHERE
-                    caption LIKE ?
+                    username LIKE ?
+                    OR caption LIKE ?
                     OR hashtags LIKE ?
-                    OR username LIKE ?
                     OR product LIKE ?
+
                 ORDER BY {sort} DESC
-                LIMIT 300
+
+                LIMIT 500
                 """,
                 (
-                    "%" + q + "%",
-                    "%" + q + "%",
-                    "%" + q + "%",
-                    "%" + q + "%"
+                    like,
+                    like,
+                    like,
+                    like
                 )
             ).fetchall()
 
@@ -1210,144 +1227,61 @@ class H(BaseHTTPRequestHandler):
                 SELECT *
                 FROM videos
                 ORDER BY {sort} DESC
-                LIMIT 300
+                LIMIT 500
                 """
             ).fetchall()
 
-        cards = []
-
-        for r in rows:
-
-            cover = r["cover"] or ""
-
-            if cover.startswith("http"):
-
-                image_html = (
-                    '<img class="cover" '
-                    'loading="lazy" '
-                    'src="'
-                    + html.escape(
-                        cover,
-                        quote=True
-                    )
-                    + '">'
-                )
-
-            else:
-
-                image_html = (
-                    '<div class="no-cover">'
-                    'Sem capa'
-                    '</div>'
-                )
-
-            product_html = ""
-
-            if r["product"]:
-
-                product_html = (
-                    '<div class="product">🛍️ '
-                    + html.escape(r["product"])
-                    + '</div>'
-                )
-
-            if (
-                r["shopee_url"]
-                and str(
-                    r["shopee_url"]
-                ).startswith("http")
-            ):
-
-                button = (
-                    '<a class="open" '
-                    'target="_blank" '
-                    'rel="noopener" '
-                    'href="'
-                    + html.escape(
-                        r["shopee_url"],
-                        quote=True
-                    )
-                    + '">'
-                    'Abrir na Shopee'
-                    '</a>'
-                )
-
-            else:
-
-                button = (
-                    '<span class="disabled">'
-                    'Link sendo identificado'
-                    '</span>'
-                )
-
-            card = (
-                '<div class="card">'
-                + image_html
-                + '<div class="body">'
-                + '<div class="user">@'
-                + html.escape(
-                    r["username"]
-                    or "desconhecido"
-                )
-                + '</div>'
-                + '<p class="caption">'
-                + html.escape(
-                    r["caption"]
-                    or ""
-                )
-                + '</p>'
-                + '<div class="stats">'
-                + '<span>👁 '
-                + number(r["views"])
-                + '</span>'
-                + '<span>❤️ '
-                + number(r["likes"])
-                + '</span>'
-                + '<span>💬 '
-                + number(r["comments"])
-                + '</span>'
-                + '</div>'
-                + product_html
-                + '<div class="tags">'
-                + html.escape(
-                    r["hashtags"]
-                    or ""
-                )
-                + '</div>'
-                + button
-                + '</div>'
-                + '</div>'
-            )
-
-            cards.append(card)
+        cards = "".join(
+            make_card(r)
+            for r in rows
+        )
 
         c.close()
 
-        cards_html = "".join(cards)
+        if not cards:
 
-        if not cards_html:
-
-            cards_html = (
-                '<p>Nenhum vídeo encontrado.</p>'
+            cards = (
+                '<div class="empty">'
+                'Nenhum vídeo encontrado.'
+                '</div>'
             )
 
-        page = (
-            PAGE
-            .replace(
-                "{{COUNT}}",
-                str(count)
-            )
-            .replace(
-                "{{Q}}",
-                html.escape(
-                    q,
-                    quote=True
-                )
-            )
-            .replace(
-                "{{CARDS}}",
-                cards_html
-            )
+        page = PAGE
+
+        page = page.replace(
+            "{{COUNT}}",
+            str(count)
+        )
+
+        page = page.replace(
+            "{{Q}}",
+            esc_attr(q)
+        )
+
+        page = page.replace(
+            "{{CARDS}}",
+            cards
+        )
+
+        page = page.replace(
+            "{{SV}}",
+            "selected"
+            if sort == "views"
+            else ""
+        )
+
+        page = page.replace(
+            "{{SL}}",
+            "selected"
+            if sort == "likes"
+            else ""
+        )
+
+        page = page.replace(
+            "{{SC}}",
+            "selected"
+            if sort == "comments"
+            else ""
         )
 
         self.send_html(page)
@@ -1362,7 +1296,7 @@ if __name__ == "__main__":
     db().close()
 
     print(
-        f"Radar rodando na porta {PORT}"
+        f"Radar Shopee rodando na porta {PORT}"
     )
 
     HTTPServer(
